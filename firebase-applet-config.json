@@ -1,0 +1,335 @@
+
+import React, { useMemo } from 'react';
+import { useAuth } from '../contexts/AuthContext';
+import type { StudentDetails, LecturerDetails, Course } from '../types';
+
+interface TimeSlot {
+    time: string;
+    monday?: string;
+    tuesday?: string;
+    wednesday?: string;
+    thursday?: string;
+    friday?: string;
+}
+
+export const TimetableView: React.FC = () => {
+    const { user, courses, lecturers, classTeachers } = useAuth();
+    const [selectedDayTab, setSelectedDayTab] = React.useState('monday');
+    const [selectedCourseId, setSelectedCourseId] = React.useState<string>('');
+    const [selectedLevel, setSelectedLevel] = React.useState<number | string>(1);
+    
+    // Auto-select for students
+    React.useEffect(() => {
+        if (user?.role === 'Student') {
+            const student = user as StudentDetails;
+            setSelectedCourseId(student.courseId || '');
+            setSelectedLevel(student.level || 1);
+        } else if (user?.role === 'Lecturer') {
+            const lecturer = user as LecturerDetails;
+            if (lecturer.modules.length > 0) {
+                 // Try to find first course related to their modules
+                 const firstModule = lecturer.modules[0];
+                 const course = courses.find(c => c.id.includes(firstModule) || firstModule.includes(c.id));
+                 if (course) setSelectedCourseId(course.id);
+            }
+        }
+    }, [user, courses]);
+
+    const canEdit = user?.role === 'HOD';
+    const isStudent = user?.role === 'Student';
+
+    const currentClassTeacher = useMemo(() => {
+        const appointment = classTeachers.find(a => a.courseId === selectedCourseId && a.level === selectedLevel);
+        if (!appointment) return null;
+        return lecturers.find(l => l.id === appointment.teacherId);
+    }, [classTeachers, selectedCourseId, selectedLevel, lecturers]);
+
+    // Curriculum Logic
+    const getModulesForLevel = (level: number) => {
+        const baseModules = [
+            "Anatomy & Phys", "Foundations of Medicine", "Professional Ethics",
+            "Public Health", "Pharmacology", "Clinical Basics"
+        ];
+        if (level === 2) return baseModules.map(m => m.replace('I', 'II').replace('Basics', 'Intermediate'));
+        if (level === 3) return baseModules.map(m => m.replace('Foundations', 'Advanced').replace('Basics', 'Clinical Rotation'));
+        return baseModules;
+    };
+
+    const normalizedLevelNum = typeof selectedLevel === 'number' ? selectedLevel : (parseInt(String(selectedLevel).replace(/[^0-9]/g, '')) - 3) || 1;
+    const myModules = useMemo(() => getModulesForLevel(normalizedLevelNum), [normalizedLevelNum]);
+
+    if (!user) return null;
+
+    // Requirement: Timetables display after course selection
+    if (!selectedCourseId && (isStudent || user.role === 'Lecturer')) {
+         return (
+             <div className="bg-white rounded-[2.5rem] shadow-sm border border-slate-100 p-12 text-center max-w-xl mx-auto">
+                 <div className="w-16 h-16 bg-cyan-50 text-cyan-500 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-inner">
+                     <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
+                 </div>
+                 <h3 className="text-xl md:text-2xl font-black text-slate-900 tracking-tight text-slate-900 tracking-tight">Select Your Course</h3>
+                 <p className="text-slate-500 mt-4 leading-relaxed font-medium text-sm">
+                     Please ensure your academic profile is complete with your <span className="text-cyan-600 font-bold uppercase tracking-widest text-xs">Course Selection</span> to view your personalized schedule.
+                 </p>
+             </div>
+         );
+    }
+
+    const currentCourse = courses.find(c => c.id === selectedCourseId);
+    const ntaLevelLabel = `NTA ${normalizedLevelNum + 3}`;
+
+    // Schedule Grid Definition
+    const schedule: TimeSlot[] = [
+        { time: '08:00 - 10:00', monday: myModules[0], tuesday: myModules[1], wednesday: myModules[2], thursday: myModules[3], friday: myModules[4] },
+        { time: '10:00 - 10:30', monday: 'Tea Break', tuesday: 'Tea Break', wednesday: 'Tea Break', thursday: 'Tea Break', friday: 'Tea Break' },
+        { time: '10:30 - 12:30', monday: myModules[5], tuesday: myModules[0], wednesday: myModules[1], thursday: myModules[2], friday: 'Self Study' },
+        { time: '12:30 - 14:00', monday: 'Lunch Break', tuesday: 'Lunch Break', wednesday: 'Lunch Break', thursday: 'Lunch Break', friday: 'Lunch Break' },
+        { time: '14:00 - 16:00', monday: myModules[3], tuesday: myModules[4], wednesday: myModules[5], thursday: myModules[0], friday: 'Recap Session' },
+    ];
+
+    const getTeacherForModule = (moduleName: string) => {
+        // HODs assign lecturers by adding module names to their 'modules' list
+        return lecturers.find(l => l.modules.includes(moduleName)) || null;
+    };
+
+    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+    const dayKeys = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'];
+
+    const MobileDayView = () => (
+        <div className="md:hidden space-y-4">
+            <div className="flex gap-2 overflow-x-auto no-scrollbar pb-2 px-1">
+                {days.map((day, i) => (
+                    <button
+                        key={day}
+                        onClick={() => setSelectedDayTab(dayKeys[i])}
+                        className={`px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all shrink-0 border-2 ${
+                            selectedDayTab === dayKeys[i]
+                                ? 'bg-slate-900 text-white border-slate-900 shadow-sm shadow-slate-200'
+                                : 'bg-white text-slate-400 border-slate-100'
+                        }`}
+                    >
+                        {day}
+                    </button>
+                ))}
+            </div>
+
+            <div className="space-y-3">
+                {schedule.map((slot, idx) => {
+                    const moduleName = (slot as any)[selectedDayTab];
+                    const teacher = getTeacherForModule(moduleName);
+                    const isSpecial = moduleName === 'Tea Break' || moduleName === 'Lunch Break' || moduleName === 'Self Study' || moduleName === 'Recap Session';
+                    
+                    if (!moduleName) return null;
+
+                    return (
+                        <div key={idx} className={`p-5 rounded-[2.5rem] border transition-all relative group ${
+                            isSpecial ? 'bg-slate-50/50 border-slate-100' : 'bg-white border-slate-100 shadow-sm'
+                        }`}>
+                            {canEdit && !isSpecial && (
+                                <button 
+                                    onClick={() => alert(`Departmental Coordination: ONLY the Head of Department (HOD) for ${currentCourse?.title} is authorized to modify this schedule. All changes are officially logged.`)}
+                                    className="absolute top-4 right-4 p-2 bg-slate-900 text-white rounded-xl shadow-sm transition-all z-10 scale-90"
+                                >
+                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                                </button>
+                            )}
+                            <div className="flex justify-between items-start mb-3">
+                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full">
+                                    {slot.time}
+                                </span>
+                                {teacher && (
+                                    <span className="text-[8px] font-black text-cyan-600 uppercase tracking-widest bg-cyan-50 px-2 py-1 rounded-lg border border-cyan-100">
+                                        Lec: {teacher.name.split(' ').slice(-1)}
+                                    </span>
+                                )}
+                            </div>
+                            <h4 className={`text-sm font-bold tracking-tight ${isSpecial ? 'text-slate-400 italic' : 'text-slate-900'}`}>
+                                {moduleName}
+                            </h4>
+                            {!isSpecial && currentClassTeacher && (
+                                <div className="mt-3 pt-3 border-t border-slate-50 flex items-center gap-2">
+                                    <div className="w-5 h-5 rounded-full bg-emerald-100 flex items-center justify-center">
+                                        <svg className="w-3 h-3 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7" /></svg>
+                                    </div>
+                                    <span className="text-[8px] font-bold text-emerald-600 uppercase tracking-widest">CT: {currentClassTeacher.name}</span>
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+
+    return (
+        <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in duration-700">
+            {/* HOD/Principal Controls */}
+            {canEdit && (
+                <div className="bg-slate-900 p-6 rounded-[2.5rem] shadow-sm border border-white/10 flex flex-wrap items-center gap-4 animate-in slide-in-from-top-4 duration-500">
+                    <div className="flex items-center gap-3 mr-4">
+                        <div className="w-10 h-10 bg-amber-500 rounded-xl flex items-center justify-center text-white shadow-sm shadow-amber-500/20">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                        </div>
+                        <div>
+                            <h4 className="text-white text-[10px] font-black uppercase tracking-widest text-slate-400 tracking-widest">Academic Coordinator</h4>
+                            <p className="text-slate-400 text-[10px] font-bold uppercase tracking-widest">Schedule Editor Interface</p>
+                        </div>
+                    </div>
+                    <select 
+                        value={selectedCourseId}
+                        onChange={(e) => setSelectedCourseId(e.target.value)}
+                        className="bg-slate-800 text-white border-white/10 rounded-xl px-4 py-2.5 text-xs font-bold focus:ring-amber-500 focus:border-amber-500"
+                    >
+                        <option value="">Select Departmental Course</option>
+                        {courses.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
+                    </select>
+                    <div className="flex gap-2">
+                        {[1, 2, 3].map(lvl => (
+                            <button
+                                key={lvl}
+                                onClick={() => setSelectedLevel(lvl)}
+                                className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                    selectedLevel === lvl 
+                                        ? 'bg-amber-500 text-white shadow-sm shadow-amber-500/20' 
+                                        : 'bg-slate-800 text-slate-400 border border-white/5 hover:bg-slate-700'
+                                }`}
+                            >
+                                NTA Level {lvl + 3}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Header Info */}
+            <div className="bg-white p-6 rounded-[2.5rem] md:rounded-[2.5rem] shadow-sm border border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                    <div className="w-12 h-12 bg-cyan-600 rounded-xl flex items-center justify-center text-white shadow-sm shadow-cyan-100 flex-shrink-0">
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    </div>
+                    <div>
+                        <h3 className="text-xl md:text-xl md:text-2xl font-black text-slate-900 tracking-tight text-slate-900 tracking-tight leading-tight">{currentCourse?.title}</h3>
+                        <div className="flex flex-wrap items-center mt-2 gap-2">
+                            <span className="bg-cyan-50 text-cyan-700 text-[10px] font-black uppercase tracking-widest text-slate-400 tracking-widest px-2.5 py-1 rounded-md border border-cyan-100">{ntaLevelLabel} Schedule</span>
+                            <span className="text-[9px] font-bold text-slate-500 uppercase tracking-widest bg-slate-50 px-2.5 py-1 rounded-md border border-slate-100">Semester I • 2024/25</span>
+                        </div>
+                    </div>
+                </div>
+                
+                {currentClassTeacher ? (
+                    <div className="bg-emerald-50 p-3.5 md:p-4 rounded-2xl border border-emerald-100 flex items-center space-x-3.5 animate-in zoom-in-95 duration-500 w-full lg:w-auto">
+                        <div className="relative flex-shrink-0">
+                            <img src={currentClassTeacher.avatar} className="w-10 h-10 rounded-xl border-2 border-white shadow-sm object-cover" alt="" />
+                            <div className="absolute -bottom-1 -right-1 bg-emerald-500 w-3.5 h-3.5 rounded-full border-2 border-white flex items-center justify-center">
+                                <svg className="w-2 h-2 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7" /></svg>
+                            </div>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <p className="text-[9px] font-bold text-emerald-600 uppercase tracking-widest leading-none mb-1">Class Teacher</p>
+                            <p className="text-sm font-bold text-slate-900 leading-none truncate">{currentClassTeacher.name}</p>
+                            <p className="text-[8px] font-semibold text-slate-400 uppercase tracking-widest mt-1 truncate">NTA Level Leader</p>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="bg-slate-50 p-3.5 md:p-4 rounded-2xl border border-slate-100 flex items-center space-x-3.5 opacity-80 w-full lg:w-auto">
+                        <div className="w-10 h-10 rounded-xl bg-slate-200 flex items-center justify-center text-slate-400 flex-shrink-0">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mb-1">Class Teacher</p>
+                            <p className="text-sm font-bold text-slate-400 italic leading-none truncate">Unappointed</p>
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Desktop Timetable Grid */}
+            <div className="hidden md:block bg-white rounded-[2.5rem] shadow-sm border border-slate-100 overflow-hidden">
+                <div className="overflow-x-auto">
+                    <table className="w-full border-collapse min-w-[1000px]">
+                        <thead>
+                            <tr className="bg-slate-900">
+                                <th className="p-4 text-left text-[9px] font-bold text-slate-400 uppercase tracking-widest w-32 border-r border-slate-800">Session</th>
+                                {days.map(day => (
+                                    <th key={day} className="p-4 text-center text-[9px] font-bold text-white uppercase tracking-widest">{day}</th>
+                                ))}
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                            {schedule.map((slot, idx) => {
+                                const isBreak = slot.monday?.includes('Break');
+                                return (
+                                    <tr key={idx} className={isBreak ? 'bg-slate-50/50' : 'hover:bg-cyan-50/10 transition-colors'}>
+                                        <td className="p-4 border-r border-slate-100 text-[10px] font-bold text-slate-900 whitespace-nowrap bg-slate-50/30">
+                                            {slot.time}
+                                        </td>
+                                        {['monday', 'tuesday', 'wednesday', 'thursday', 'friday'].map(dayKey => {
+                                            const moduleName = (slot as any)[dayKey];
+                                            const teacher = getTeacherForModule(moduleName);
+                                            const isSpecial = moduleName === 'Tea Break' || moduleName === 'Lunch Break' || moduleName === 'Self Study' || moduleName === 'Recap Session';
+
+                                            return (
+                                                <td key={dayKey} className={`p-4 text-center transition-all ${isBreak ? 'opacity-50' : ''} relative group`}>
+                                                    {moduleName && (
+                                                        <div className="space-y-1.5">
+                                                            <p className={`text-xs font-bold tracking-tight ${isSpecial ? 'text-slate-400 italic' : 'text-slate-900'}`}>
+                                                                {moduleName}
+                                                            </p>
+                                                            {canEdit && !isSpecial && (
+                                                                <button 
+                                                                    onClick={() => alert(`Institutional Policy: Timetable modifications are restricted to the Head of Department (HOD). Please contact the academic office for coordination.`)}
+                                                                    className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 p-1.5 bg-white shadow-sm border border-slate-100 rounded-lg text-amber-500 hover:bg-amber-50 transition-all z-20"
+                                                                    title="Edit Session"
+                                                                >
+                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                                                                </button>
+                                                            )}
+                                                            {!isSpecial && (
+                                                                <div className="flex flex-col items-center animate-in fade-in zoom-in-95 duration-500">
+                                                                    <div className="h-[1px] w-6 bg-slate-100 my-1.5"></div>
+                                                                    
+                                                                    {/* Lecturer Display */}
+                                                                    {teacher ? (
+                                                                        <span className="text-[7px] font-bold text-cyan-600 uppercase tracking-widest bg-cyan-50 px-1.5 py-0.5 rounded border border-cyan-100 mb-0.5">
+                                                                            Lec: {teacher.name.split(' ').slice(-1)}
+                                                                        </span>
+                                                                    ) : (
+                                                                        <span className="text-[7px] font-semibold text-red-400 uppercase tracking-widest block mb-0.5">Lecturer Pending</span>
+                                                                    )}
+
+                                                                    {/* Class Teacher (Dynamic Appointment) */}
+                                                                    {currentClassTeacher && (
+                                                                        <span className="text-[6px] font-bold text-emerald-600 uppercase tracking-tighter opacity-80">
+                                                                            CT: {currentClassTeacher.name.split(' ').slice(-1)}
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </td>
+                                            );
+                                        })}
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            {/* Mobile Timetable View */}
+            <MobileDayView />
+
+            {/* Footer Disclaimer */}
+            <div className="flex flex-col md:flex-row items-center justify-between px-6 gap-4 text-[8px] font-bold text-slate-400 uppercase tracking-widest">
+                <p>Generated by MCHAS Academic Office • Official Departmental Record</p>
+                <div className="flex space-x-4">
+                    <span className="flex items-center"><span className="w-1.5 h-1.5 bg-cyan-500 rounded-full mr-1.5"></span> Core Lectures</span>
+                    <span className="flex items-center"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full mr-1.5"></span> Class Teacher (CT)</span>
+                    <span className="flex items-center"><span className="w-1.5 h-1.5 bg-slate-200 rounded-full mr-1.5"></span> College Breaks</span>
+                </div>
+            </div>
+        </div>
+    );
+};

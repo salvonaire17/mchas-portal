@@ -1,0 +1,1414 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { useAuth } from '../contexts/AuthContext';
+import { motion, AnimatePresence } from 'motion/react';
+import { CheckCircle2, Circle, AlertCircle, Clock, ChevronDown, Lock, User, Building, ShieldCheck, GraduationCap, ClipboardCheck, Award } from 'lucide-react';
+import { doc, onSnapshot, setDoc, updateDoc, collection, query, orderBy, limit, startAfter, writeBatch } from 'firebase/firestore';
+import { db } from '../services/firebase';
+import { toast } from 'react-hot-toast';
+
+const ALL_ROLES = [
+  'Student',
+  'Admission Officer',
+  'Bursar',
+  'NHIF Officer',
+  'Supplies Officer',
+  'HOD',
+  'Warden',
+  'Vice Principal'
+];
+
+const getFormattedHostelText = (wardenData: any) => {
+    if (!wardenData) return 'N/A';
+    if (wardenData.status !== 'APPROVED') return 'Awaiting Allocation';
+    if (!wardenData.hostelAssigned) return `room number ${wardenData.roomAssigned}`;
+
+    // hostelAssigned format: "Older Hostel - A" or "New Hostel (Female) - F2"
+    if (wardenData.hostelAssigned.includes('Older Hostel')) {
+        const blockMatch = wardenData.hostelAssigned.split(' - ');
+        return `Older Hostel, Block ${blockMatch[1] || ''}, room number ${wardenData.roomAssigned || ''}`;
+    } else {
+        const textMatch = wardenData.hostelAssigned.match(/(New Hostel[^\-]*)-\s*(.*)/);
+        if (textMatch) {
+            return `New Hostel, ${textMatch[2]}, room number ${wardenData.roomAssigned}`;
+        }
+    }
+    return `${wardenData.hostelAssigned}, room number ${wardenData.roomAssigned}`;
+}
+
+export const RegistrationView: React.FC<{ forcedStep?: 'ADMISSION' | 'BURSAR' | 'PHASE2' }> = ({ forcedStep }) => {
+    const { user, registrationData, isRegistrationLoading } = useAuth();
+    // 1. TAMPER PROOF ROLE SWITCHER FOR TESTING
+    const [activeRole, setActiveRole] = useState<string>(user?.role === 'Admin' ? 'Admission Officer' : (user?.role || 'Student'));
+
+    // 2. PAGINATED REAL-TIME DATA LISTENER (Only for Officers)
+    const [registrations, setRegistrations] = useState<Record<string, any>>({});
+    const [lastVisible, setLastVisible] = useState<any>(null);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(true);
+
+    const loadRegistrations = (isInitial = true) => {
+        if (!isInitial && !hasMore) return;
+        if (activeRole === 'Student') return; // Students don't need the queue
+
+        const regsRef = collection(db, 'registrations');
+        let q = query(regsRef, orderBy('__name__'), limit(25)); // Order by ID string
+        
+        if (!isInitial && lastVisible) {
+            q = query(regsRef, orderBy('__name__'), startAfter(lastVisible), limit(25));
+        }
+
+        const unsub = onSnapshot(q, (snapshot) => {
+            const data: Record<string, any> = isInitial ? {} : { ...registrations };
+            snapshot.forEach((doc) => {
+                data[doc.id] = doc.data();
+            });
+            
+            setRegistrations(data);
+            if (snapshot.docs.length > 0) {
+                setLastVisible(snapshot.docs[snapshot.docs.length - 1]);
+            }
+            if (snapshot.docs.length < 25) {
+                setHasMore(false);
+            }
+            setLoadingMore(false);
+        });
+        return unsub;
+    };
+
+    useEffect(() => {
+        const unsub = loadRegistrations(true);
+        return () => unsub && unsub();
+    }, []);
+
+    const loadMore = () => {
+        if (!loadingMore && hasMore) {
+            loadRegistrations(false);
+        }
+    };
+
+    if (!user) return null;
+
+    return (
+        <div className="bg-slate-50 min-h-screen pb-20">
+            {/* Top UI Test Switcher Bar */}
+            {['Admin', 'System Administrator'].includes(user.role) && (
+                <div className="bg-slate-800 text-white p-3 sticky top-0 z-50 shadow-sm">
+                    <div className="max-w-6xl mx-auto flex items-center justify-between">
+                        <span className="font-bold text-sm tracking-wide text-slate-300">ROLE SIMULATOR:</span>
+                        <div className="flex gap-2 bg-slate-900 p-1 rounded-xl overflow-x-auto">
+                            {ALL_ROLES.map(r => (
+                                <button
+                                    key={r}
+                                    onClick={() => setActiveRole(r)}
+                                    className={`px-3 py-1 text-xs font-bold rounded-lg whitespace-nowrap transition-all ${activeRole === r ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                                >
+                                    {r}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {activeRole === 'Student' ? (
+                <StudentRegistrationWorkspace user={user} myReg={registrationData} isRegistrationLoading={isRegistrationLoading} forcedStep={forcedStep} />
+            ) : (
+                <OfficerRegistrationQueue 
+                    role={activeRole} 
+                    user={user}
+                    registrations={registrations} 
+                    setRegistrations={setRegistrations}
+                    loadMore={loadMore} 
+                    loadingMore={loadingMore} 
+                    hasMore={hasMore} 
+                />
+            )}
+        </div>
+    );
+};
+
+const StudentRegistrationWorkspace = ({ user, myReg, isRegistrationLoading, forcedStep }: { user: any, myReg: any, isRegistrationLoading: boolean, forcedStep?: string }) => {
+    const { submitRegistrationPhase1, markRegistrationPaid, submitRegistrationPhase2 } = useAuth();
+    
+    const [localForm, setLocalForm] = useState({
+        name: user.name || '',
+        registrationNumber: user.nactvetRegNo || user.registrationNumber || user.email?.split('@')[0] || user.id,
+        course: user.courseId || '',
+        level: user.level || 'NTA 4',
+        phoneNumber: user.phone || '',
+        heslbStatus: 'Select Funding Source',
+        loanPercentage: 'Allocation Pending / Under Review',
+        housingStatus: 'Hostel',
+        age: 19,
+        nida: ''
+    });
+
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [p2Date, setP2Date] = useState('');
+
+    const updateForm = (key: string, value: any) => {
+        setLocalForm(prev => ({ ...prev, [key]: value }));
+    };
+
+    const isSubmitted = myReg !== null;
+    const requiresNida = localForm.age >= 18;
+
+    // Hard Guardrails Check
+    const isAdmissionApproved = myReg?.phase1?.admission?.status === 'APPROVED';
+    const isBursarConfirmed = myReg?.phase1?.bursar?.status === 'CONFIRMED';
+    const isNhifConfirmed = myReg?.phase1?.nhif?.status === 'CONFIRMED';
+    const isSuppliesApproved = myReg?.phase1?.supplies?.status === 'APPROVED';
+    const isHodApproved = myReg?.phase2?.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' || myReg?.phase2?.hod?.status === 'APPROVED';
+
+    const phase1FullyApproved = isAdmissionApproved && isBursarConfirmed && isNhifConfirmed && isSuppliesApproved;
+
+    const getStatusTrackerPhase1 = () => {
+        if (phase1FullyApproved) return 'green';
+        if (isSubmitted) return 'yellow';
+        return 'gray';
+    };
+
+    if (isRegistrationLoading) {
+        return (
+            <div className="flex flex-col items-center justify-center p-20 gap-4">
+                <div className="w-12 h-12 border-4 border-slate-200 border-t-blue-600 rounded-full animate-spin"></div>
+                <p className="text-slate-500 font-bold text-xs uppercase tracking-widest">Loading Registration Node...</p>
+            </div>
+        );
+    }
+
+    const [showP2Form, setShowP2Form] = useState(false);
+
+    return (
+        <div className="space-y-6 pt-8 max-w-5xl mx-auto px-4">
+            {/* PERSONALIZED STUDENT HEADER */}
+            <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-6 relative overflow-hidden">
+                <div className="absolute top-0 right-0 p-8 opacity-[0.03] rotate-12">
+                    <User className="w-32 h-32" />
+                </div>
+                <div className="flex items-center gap-6 relative z-10">
+                    <div className="w-20 h-20 bg-blue-100 text-cyan-700 rounded-[2.5rem] flex items-center justify-center shadow-inner relative">
+                        <User className="w-10 h-10" />
+                        {phase1FullyApproved && <div className="absolute -top-2 -right-2 w-8 h-8 bg-green-500 rounded-full border-4 border-white flex items-center justify-center text-white"><CheckCircle2 className="w-4 h-4" /></div>}
+                    </div>
+                    <div>
+                        <div className="flex items-center gap-3 mb-1">
+                            <h2 className="text-3xl font-black text-slate-800 uppercase tracking-tight">{user.name}</h2>
+                            <span className="bg-slate-100 text-slate-500 text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-[0.2em]">
+                                {user.nactvetRegNo || user.id.substring(0, 8).toUpperCase()}
+                            </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <div className="bg-cyan-50 text-blue-700 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-cyan-100 flex items-center gap-1.5">
+                                <GraduationCap className="w-3 h-3" />
+                                Student Portal
+                            </div>
+                            {phase1FullyApproved && (
+                                <div className="bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-emerald-100 flex items-center gap-1.5 animate-in slide-in-from-left-2">
+                                    <ShieldCheck className="w-3 h-3" />
+                                    Phase 1 Verified
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+                
+                <div className="flex flex-col items-end gap-2 relative z-10">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Global Status</span>
+                    <div className={`px-5 py-2 rounded-2xl font-black uppercase tracking-[0.2em] text-xs shadow-sm ${myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? 'bg-green-600 text-white' : phase1FullyApproved ? 'bg-cyan-600 text-white' : isSubmitted ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-500'}`}>
+                        {myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? 'MCHAS Registered' : phase1FullyApproved ? 'Phase 2: Institutional' : isSubmitted ? 'Phase 1: Verification' : 'Not Started'}
+                    </div>
+                </div>
+            </div>
+            {/* ALERT BOX FOR FORCED STATES */}
+            {forcedStep && (
+                <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-red-600 text-white p-4 rounded-2xl shadow-sm shadow-red-200 flex items-center justify-between mb-8 overflow-hidden relative">
+                    <div className="flex items-center gap-4 relative z-10">
+                        <div className="bg-white/20 p-2 rounded-lg">
+                            <Lock className="w-5 h-5" />
+                        </div>
+                        <div>
+                            <h3 className="font-black text-sm uppercase tracking-widest">Access Restricted</h3>
+                            <p className="text-xs text-red-100 font-medium">Please complete your <b>{forcedStep}</b> clearance to unlock your dashboard.</p>
+                        </div>
+                    </div>
+                </motion.div>
+            )}
+
+            {/* PROGRESS TRACKER */}
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h3 className="text-sm font-bold text-slate-500 uppercase tracking-widest mb-6">Global Registration Status</h3>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    <div className={`p-4 rounded-2xl border-2 transition-all ${getStatusTrackerPhase1() === 'green' ? 'border-green-500 bg-green-50' : getStatusTrackerPhase1() === 'yellow' ? 'border-amber-400 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
+                        <h4 className="font-bold mb-4 flex items-center justify-between text-slate-800">
+                            Phase 1: Initial Verifications
+                            {phase1FullyApproved && <CheckCircle2 className="w-5 h-5 text-green-600" />}
+                        </h4>
+                        <div className="space-y-3 text-sm">
+                            <TrackerItem label="Submission to Admission" done={isSubmitted} />
+                            <TrackerItem label="Admissions Clearance" done={isAdmissionApproved} />
+                            <TrackerItem label="Bursar (Fees) Clearance" done={isBursarConfirmed} />
+                            <TrackerItem label="NHIF Clearance" done={isNhifConfirmed} />
+                            <TrackerItem label="Supplies Clearance" done={isSuppliesApproved} />
+                        </div>
+                    </div>
+
+                    <div className={`p-4 rounded-2xl border-2 transition-all ${phase1FullyApproved ? 'border-blue-400 bg-cyan-50' : 'border-slate-200 bg-slate-50 opacity-50'}`}>
+                        <h4 className="font-bold mb-4 flex items-center justify-between text-slate-800">
+                            Phase 2: Final Clearances
+                            {!phase1FullyApproved && <Lock className="w-4 h-4 text-slate-400" />}
+                        </h4>
+                        <div className="space-y-3 text-sm">
+                            <TrackerItem label="Departmental (HOD)" done={myReg?.phase2?.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' || myReg?.phase2?.hod?.status === 'APPROVED'} />
+                            <TrackerItem label="Hostel/Residence (Warden)" done={myReg?.phase2?.warden?.status === 'APPROVED'} />
+                            <TrackerItem label="Final Approval (Principal Office)" done={myReg?.phase2?.vicePrincipal?.status === 'APPROVED'} />
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div className="min-h-[400px]">
+                {!isSubmitted ? (
+                    <div className="max-w-2xl w-full animate-in fade-in slide-in-from-bottom-4">
+                        <div className="flex items-center gap-3 mb-6">
+                            <div className="p-3 bg-blue-100 text-blue-700 rounded-xl">
+                                <ClipboardCheck className="w-6 h-6" />
+                            </div>
+                            <h2 className="text-xl md:text-2xl font-black text-slate-900 tracking-tight text-slate-800 uppercase tracking-tight">Step 1: Identity Admission Submission</h2>
+                        </div>
+                        <div className="space-y-6 w-full bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm">
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-xs font-bold text-slate-500 block mb-1">Official Name (Matches Admission Letter)</label>
+                                    <input type="text" value={localForm.name} onChange={e => updateForm('name', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold" />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-bold text-slate-500 block mb-1">Registration/Index Number</label>
+                                    <input type="text" value={localForm.registrationNumber} onChange={e => updateForm('registrationNumber', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold" />
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">Course of Study</label>
+                                        <div className="relative">
+                                            <select value={localForm.course} disabled={isSubmitted} onChange={e => updateForm('course', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl appearance-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold disabled:opacity-50 disabled:cursor-not-allowed">
+                                                <option value="">Select Course...</option>
+                                                {useAuth().courses.map(c => (
+                                                    <option key={c.id} value={c.id}>{c.title}</option>
+                                                ))}
+                                            </select>
+                                            <div className="absolute inset-y-0 right-0 flex items-center pr-4 pointer-events-none text-slate-400">
+                                                <ChevronDown className="w-5 h-5" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">NTA Level</label>
+                                        <div className="relative">
+                                            <select value={localForm.level} onChange={e => updateForm('level', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl appearance-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold">
+                                                <option value="">Select Level...</option>
+                                                <option value="NTA 4">NTA 4</option>
+                                                <option value="NTA 5">NTA 5</option>
+                                                <option value="NTA 6">NTA 6</option>
+                                            </select>
+                                            <div className="absolute inset-y-0 right-0 flex items-center pr-4 pointer-events-none text-slate-400">
+                                                <ChevronDown className="w-5 h-5" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">Phone Number</label>
+                                        <input type="tel" value={localForm.phoneNumber} onChange={e => updateForm('phoneNumber', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold shadow-sm" />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">Funding Source</label>
+                                        <div className="relative shadow-sm rounded-xl">
+                                            <select value={localForm.heslbStatus} onChange={e => updateForm('heslbStatus', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl appearance-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold cursor-pointer">
+                                                <option value="Select Funding Source">Select Funding Source</option>
+                                                <option value="Self-Sponsored (Private)">Self-Sponsored (Private)</option>
+                                                <option value="Parents">Parents</option>
+                                                <option value="Loan Beneficiary">Loan Beneficiary</option>
+                                            </select>
+                                            <div className="absolute inset-y-0 right-0 flex items-center pr-4 pointer-events-none text-slate-400">
+                                                <ChevronDown className="w-5 h-5" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                {localForm.heslbStatus === 'Loan Beneficiary' && (
+                                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} className="pt-2">
+                                        <label className="text-xs font-bold text-slate-500 flex items-center gap-1 mb-1">Loan Allocation Status</label>
+                                        <div className="relative shadow-sm rounded-xl">
+                                            <select value={localForm.loanPercentage} onChange={e => updateForm('loanPercentage', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl appearance-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold cursor-pointer">
+                                                <option value="100%">100%</option>
+                                                <option value="80%">80%</option>
+                                                <option value="60%">60%</option>
+                                                <option value="Allocation Pending / Under Review">Allocation Pending / Under Review</option>
+                                            </select>
+                                            <div className="absolute inset-y-0 right-0 flex items-center pr-4 pointer-events-none text-slate-400">
+                                                <ChevronDown className="w-5 h-5" />
+                                            </div>
+                                        </div>
+                                    </motion.div>
+                                )}
+                                
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">Age</label>
+                                        <input type="number" value={localForm.age} onChange={e => updateForm('age', parseInt(e.target.value) || 0)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold shadow-sm" />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-500 block mb-1">Housing Preference</label>
+                                        <div className="relative shadow-sm rounded-xl">
+                                            <select value={localForm.housingStatus} onChange={e => updateForm('housingStatus', e.target.value)} className="w-full py-3 px-4 text-slate-800 bg-slate-50 border border-slate-200 rounded-xl appearance-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-bold cursor-pointer">
+                                                <option value="Hostel">Hostel</option>
+                                                <option value="Nje ya Chuo">Nje ya Chuo</option>
+                                            </select>
+                                            <div className="absolute inset-y-0 right-0 flex items-center pr-4 pointer-events-none text-slate-400">
+                                                <ChevronDown className="w-5 h-5" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <AnimatePresence>
+                                {requiresNida && (
+                                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="pt-2">
+                                        <label className="text-xs font-bold text-slate-500 flex items-center gap-1 mb-1">NIDA Number <span className="text-red-500">*</span> <span className="text-slate-400 font-normal">(Required for 18+)</span></label>
+                                        <input type="text" value={localForm.nida} onChange={e => updateForm('nida', e.target.value)} placeholder="199912..." className="w-full py-3 px-4 text-slate-800 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500 transition-all shadow-sm" />
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+                            
+                            <button onClick={() => submitRegistrationPhase1(localForm)} className="w-full mt-6 bg-cyan-600 hover:bg-blue-700 text-white font-black py-4 rounded-2xl transition-all shadow-sm shadow-blue-200 flex justify-center items-center gap-2 uppercase tracking-widest text-xs">
+                                Submit for Admission Clearance
+                            </button>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="space-y-6">
+                        {!isAdmissionApproved && (
+                           <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="bg-white p-10 rounded-[2.5rem] border border-slate-200 shadow-sm text-center max-w-2xl">
+                                <Clock className="w-12 h-12 text-amber-500 mx-auto mb-4 animate-pulse" />
+                                <h3 className="text-lg font-black text-slate-800 uppercase tracking-tight">Awaiting Admission Verification</h3>
+                                <p className="text-slate-500 text-sm mt-2">Your documents have been submitted to the Admissions Office. Please visit the office for physical verification if required.</p>
+                                <div className="mt-8 pt-8 border-t border-slate-100 grid grid-cols-2 gap-4 text-left">
+                                    <div className="bg-slate-50 p-4 rounded-xl">
+                                        <p className="text-[10px] font-bold text-slate-400 uppercase">Submisison ID</p>
+                                        <p className="font-mono text-xs font-bold text-slate-700">{user.id.substring(0, 12).toUpperCase()}</p>
+                                    </div>
+                                    <div className="bg-slate-50 p-4 rounded-xl">
+                                        <p className="text-[10px] font-bold text-slate-400 uppercase">Queue Status</p>
+                                        <p className="text-amber-600 font-bold text-xs uppercase">Initial Review</p>
+                                    </div>
+                                </div>
+                           </motion.div>
+                        )}
+
+                        {isAdmissionApproved && (!isBursarConfirmed || !isNhifConfirmed || !isSuppliesApproved) && (
+                            <div className="bg-amber-50 border border-amber-200 p-8 rounded-[2.5rem] max-w-4xl shadow-sm">
+                                <h3 className="font-black text-amber-900 mb-6 flex items-center gap-2 uppercase tracking-tight"><ShieldCheck className="w-6 h-6"/> Phase 1: Payment Checkpoints</h3>
+                                
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                    {/* Bursar Section */}
+                                    <div className="bg-white p-6 rounded-2xl border border-amber-200 shadow-sm relative overflow-hidden">
+                                        <h4 className="font-bold text-xs text-slate-400 uppercase tracking-widest mb-4">Tuition Fees & Other</h4>
+                                        {myReg.phase1.bursar.controlNumber ? (
+                                            isBursarConfirmed ? (
+                                                <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-100 text-center">
+                                                    <span className="text-emerald-600 font-black text-xs uppercase flex items-center justify-center gap-2"><CheckCircle2 className="w-4 h-4"/> Payment Verified</span>
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-4">
+                                                    <div className="text-xl font-mono tracking-widest font-black text-slate-800 bg-slate-50 p-4 rounded-2xl text-center border-2 border-dashed border-amber-200">
+                                                        {myReg.phase1.bursar.controlNumber}
+                                                    </div>
+                                                    <p className="text-[10px] text-center text-amber-700 font-bold uppercase">Pay at NMB/CRDB/NBC Bank</p>
+                                                    {myReg.phase1.bursar.studentMarkedPaid ? (
+                                                        <div className="flex items-center justify-center gap-2 text-amber-600 font-black text-[10px] uppercase bg-amber-100/50 py-2 rounded-lg">
+                                                            <Clock className="w-3 h-3 animate-spin" /> Pending Approval
+                                                        </div>
+                                                    ) : (
+                                                        <button onClick={() => markRegistrationPaid('bursar')} className="w-full bg-emerald-600 text-white py-4 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-emerald-700 transition-all shadow-sm shadow-emerald-100">Paid?</button>
+                                                    )}
+                                                </div>
+                                            )
+                                        ) : (
+                                            <div className="flex flex-col items-center justify-center py-6 text-slate-400 gap-2">
+                                                <Clock className="w-6 h-6 animate-pulse" />
+                                                <span className="text-[10px] font-bold uppercase">Generating...</span>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* NHIF Section */}
+                                    <div className="bg-white p-6 rounded-2xl border border-amber-200 shadow-sm">
+                                        <h4 className="font-bold text-xs text-slate-400 uppercase tracking-widest mb-4">Health Insurance (NHIF)</h4>
+                                        {myReg.phase1.nhif.controlNumber ? (
+                                            isNhifConfirmed ? (
+                                                <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-100 text-center">
+                                                    <span className="text-emerald-600 font-black text-xs uppercase flex items-center justify-center gap-2"><CheckCircle2 className="w-4 h-4"/> NHIF Registered</span>
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-4">
+                                                    <div className="text-xl font-mono tracking-widest font-black text-slate-800 bg-slate-50 p-4 rounded-2xl text-center border-2 border-dashed border-amber-200">
+                                                        {myReg.phase1.nhif.controlNumber}
+                                                    </div>
+                                                    <p className="text-[10px] text-center text-amber-700 font-bold uppercase">Pay NHIF Fee</p>
+                                                    {myReg.phase1.nhif.studentMarkedPaid ? (
+                                                        <div className="flex items-center justify-center gap-2 text-amber-600 font-black text-[10px] uppercase bg-amber-100/50 py-2 rounded-lg">
+                                                            <Clock className="w-3 h-3 animate-spin" /> Awaiting Office
+                                                        </div>
+                                                    ) : (
+                                                        <button onClick={() => markRegistrationPaid('nhif')} className="w-full bg-emerald-600 text-white py-4 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-emerald-700 transition-all shadow-sm shadow-emerald-100">Paid?</button>
+                                                    )}
+                                                </div>
+                                            )
+                                        ) : (
+                                            <div className="flex flex-col items-center justify-center py-6 text-slate-400 gap-2">
+                                                <Clock className="w-6 h-6 animate-pulse" />
+                                                <span className="text-[10px] font-bold uppercase">Awaiting...</span>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Supplies Section */}
+                                    <div className="bg-white p-6 rounded-2xl border border-amber-200 shadow-sm">
+                                        <h4 className="font-bold text-xs text-slate-400 uppercase tracking-widest mb-4">Equipment & Supplies</h4>
+                                        {myReg.phase1.supplies?.controlNumber ? (
+                                            isSuppliesApproved ? (
+                                                <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-100 text-center">
+                                                    <span className="text-emerald-600 font-black text-xs uppercase flex items-center justify-center gap-2"><CheckCircle2 className="w-4 h-4"/> Supplies Cleared</span>
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-4">
+                                                    <div className="text-xl font-mono tracking-widest font-black text-slate-800 bg-slate-50 p-4 rounded-2xl text-center border-2 border-dashed border-amber-200">
+                                                        {myReg.phase1.supplies.controlNumber}
+                                                    </div>
+                                                    <p className="text-[10px] text-center text-amber-700 font-bold uppercase">Pay for Equipments</p>
+                                                    {myReg.phase1.supplies.studentMarkedPaid ? (
+                                                        <div className="flex items-center justify-center gap-2 text-amber-600 font-black text-[10px] uppercase bg-amber-100/50 py-2 rounded-lg">
+                                                            <Clock className="w-3 h-3 animate-spin" /> Verifying Kits...
+                                                        </div>
+                                                    ) : (
+                                                        <button onClick={() => markRegistrationPaid('supplies')} className="w-full bg-emerald-600 text-white py-4 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-emerald-700 transition-all shadow-sm shadow-emerald-100">Paid?</button>
+                                                    )}
+                                                </div>
+                                            )
+                                        ) : (
+                                            <div className="flex flex-col items-center justify-center py-6 text-slate-400 gap-2 text-center">
+                                                <ClipboardCheck className="w-6 h-6 animate-pulse" />
+                                                <span className="text-[10px] font-bold uppercase">Awaiting Office...</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {phase1FullyApproved && myReg.phase2?.vicePrincipal?.status === 'APPROVED' && (
+                            <div className="bg-white p-8 md:p-12 rounded-[2.5rem] shadow-sm border border-slate-200 relative overflow-hidden">
+                                <div className="absolute top-0 right-0 p-12 opacity-[0.02]">
+                                    <ShieldCheck className="w-64 h-64 text-emerald-900" />
+                                </div>
+                                <div className="relative z-10 flex flex-col items-center text-center">
+                                    <div className="w-24 h-24 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600 shadow-inner mb-6">
+                                        <Award className="w-12 h-12" />
+                                    </div>
+                                    <h2 className="text-4xl font-black text-slate-900 uppercase tracking-tight mb-2">Registration Complete</h2>
+                                    <p className="text-slate-500 text-sm font-medium max-w-xl mx-auto mb-8">
+                                        You have successfully satisfied all institutional requirements and are officially enrolled for the academic session at MCHAS. You now have full access to your student portal features.
+                                    </p>
+                                    
+                                    <div className="w-full max-w-2xl bg-slate-50 border border-slate-200 rounded-2xl p-6 text-left">
+                                        <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 border-b border-slate-200 pb-4">Official Clearance Document</h4>
+                                        <div className="space-y-4">
+                                            <div className="flex items-center justify-between p-4 bg-white rounded-xl border border-slate-100">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-10 h-10 bg-green-50 rounded-lg flex items-center justify-center text-green-600">
+                                                        <CheckCircle2 className="w-5 h-5" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-bold text-slate-800 text-sm">Admissions Verification</p>
+                                                        <p className="text-xs text-slate-500">Student identity and documents verified.</p>
+                                                    </div>
+                                                </div>
+                                                <span className="text-[10px] font-black text-green-600 uppercase tracking-widest bg-green-50 px-3 py-1 rounded-full">Cleared</span>
+                                            </div>
+                                            
+                                            <div className="flex items-center justify-between p-4 bg-white rounded-xl border border-slate-100">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-10 h-10 bg-green-50 rounded-lg flex items-center justify-center text-green-600">
+                                                        <CheckCircle2 className="w-5 h-5" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-bold text-slate-800 text-sm">Financial Clearance</p>
+                                                        <p className="text-xs text-slate-500">Fees (Bursar) and Medical (NHIF) cleared.</p>
+                                                    </div>
+                                                </div>
+                                                <span className="text-[10px] font-black text-green-600 uppercase tracking-widest bg-green-50 px-3 py-1 rounded-full">Cleared</span>
+                                            </div>
+
+                                            <div className="flex items-center justify-between p-4 bg-white rounded-xl border border-slate-100">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-10 h-10 bg-green-50 rounded-lg flex items-center justify-center text-green-600">
+                                                        <CheckCircle2 className="w-5 h-5" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-bold text-slate-800 text-sm">Department Registration</p>
+                                                        <p className="text-xs text-slate-500">HOD clearance and course enrollment confirmed.</p>
+                                                    </div>
+                                                </div>
+                                                <span className="text-[10px] font-black text-green-600 uppercase tracking-widest bg-green-50 px-3 py-1 rounded-full">Cleared</span>
+                                            </div>
+
+                                            <div className="flex items-center justify-between p-4 bg-white rounded-xl border border-slate-100">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-10 h-10 bg-green-50 rounded-lg flex items-center justify-center text-green-600">
+                                                        <CheckCircle2 className="w-5 h-5" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-bold text-slate-800 text-sm">Residence Integration</p>
+                                                        <p className="text-xs text-slate-500">Hostel space processed: {getFormattedHostelText(myReg.phase2?.warden)}.</p>
+                                                    </div>
+                                                </div>
+                                                <span className="text-[10px] font-black text-green-600 uppercase tracking-widest bg-green-50 px-3 py-1 rounded-full">Cleared</span>
+                                            </div>
+
+                                            <div className="flex items-center justify-between p-4 bg-emerald-50 rounded-xl border border-emerald-100">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-10 h-10 bg-emerald-100 rounded-lg flex items-center justify-center text-emerald-600">
+                                                        <Award className="w-5 h-5" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-bold text-emerald-900 text-sm">Vice Principal Certification</p>
+                                                        <p className="text-xs text-emerald-700">Final institutional validation completed.</p>
+                                                    </div>
+                                                </div>
+                                                <span className="text-[10px] font-black text-white uppercase tracking-widest bg-emerald-600 px-3 py-1 rounded-full hidden md:block mt-2 md:mt-0">Certified</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {phase1FullyApproved && myReg.phase2?.vicePrincipal?.status !== 'APPROVED' && (
+                            <div className="bg-white rounded-[2.5rem] shadow-sm shadow-slate-200 border border-slate-100 overflow-hidden">
+                                <div className="bg-cyan-600 p-8 text-white relative overflow-hidden">
+                                    <div className="absolute top-0 right-0 p-6 opacity-10">
+                                        <ShieldCheck className="w-24 h-24" />
+                                    </div>
+                                    <div className="relative z-10">
+                                        <div className="flex items-center gap-3 mb-2">
+                                            <div className="bg-cyan-600/30 p-2 rounded-lg backdrop-blur-md">
+                                                <ShieldCheck className="w-5 h-5 text-blue-100" />
+                                            </div>
+                                            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-100">Phase 2: Institutional Integration</span>
+                                        </div>
+                                        <h3 className="text-3xl font-black uppercase tracking-tight">Clearance In Progress</h3>
+                                        <p className="text-blue-100 mt-2 text-sm font-medium max-w-xl">Your institutional profile is being verified by the Academic and Residence offices. Once all clearances are obtained, the Vice Principal will issue your final registration certificate.</p>
+                                    </div>
+                                </div>
+
+                                <div className="p-8">
+                                    
+                                    {(myReg.phase2.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' || myReg.phase2.hod?.status === 'APPROVED') && (
+                                        <div className="mb-8 p-6 bg-cyan-50 border-2 border-dashed border-blue-200 rounded-2xl flex items-center gap-6 animate-in slide-in-from-top-4">
+                                            <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center shadow-sm text-cyan-700">
+                                                <Lock className="w-6 h-6" />
+                                            </div>
+                                            <div>
+                                                <h4 className="font-black text-blue-900 uppercase text-xs tracking-widest">Recommended to Vice Principal</h4>
+                                                <p className="text-[10px] text-cyan-700 font-bold mt-1">Your academic clearance is complete. The Principal's office is now reviewing your final index for certification.</p>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="space-y-6">
+                                        {!myReg.phase2Data && !showP2Form ? (
+                                            <div className="space-y-6">
+                                                <div className="p-8 bg-slate-50 rounded-2xl border border-slate-100 text-center">
+                                                    <div className="w-16 h-16 bg-blue-100 text-cyan-700 rounded-full flex items-center justify-center mx-auto mb-4">
+                                                        <ClipboardCheck className="w-8 h-8" />
+                                                    </div>
+                                                    <h4 className="text-lg font-black text-slate-800 uppercase tracking-tight mb-2">Final Step: Student Inputs</h4>
+                                                    <p className="text-slate-500 text-sm max-w-sm mx-auto mb-8">Please provide your academic and payment details one last time to sync your profile with the HOD systems.</p>
+                                                    <button 
+                                                        onClick={() => setShowP2Form(true)}
+                                                        className="w-full bg-cyan-600 font-black text-white py-5 rounded-2xl hover:bg-blue-700 transition-all shadow-sm shadow-blue-200 uppercase tracking-[0.2em] text-xs flex items-center justify-center gap-3 group"
+                                                    >
+                                                        Fill Registration Supplement
+                                                        <ChevronDown className="w-4 h-4 group-hover:translate-y-1 transition-transform" />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ) : !myReg.phase2Data && showP2Form ? (
+                                            <div className="space-y-4 animate-in fade-in zoom-in-95">
+                                                <div className="p-6 bg-slate-50 rounded-2xl border border-slate-200">
+                                                    <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
+                                                        <CheckCircle2 className="w-4 h-4" />
+                                                        Registration Supplement Form
+                                                    </h4>
+                                                    
+                                                    <div className="space-y-4">
+                                                        <div>
+                                                            <label className="text-[10px] font-bold text-slate-500 uppercase">Full Name (Official)</label>
+                                                            <input id="p2-name" type="text" defaultValue={user?.name || ''} className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 transition-all" />
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-[10px] font-bold text-slate-500 uppercase">Registration / Index Number</label>
+                                                            <input id="p2-regNum" type="text" defaultValue={myReg.studentDetails?.registrationNumber || ''} className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 transition-all" />
+                                                        </div>
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                            <div>
+                                                                <label className="text-[10px] font-bold text-slate-500 uppercase">Level of Study</label>
+                                                                <select id="p2-level" defaultValue={myReg.studentDetails?.level || 'NTA Level 4'} className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700">
+                                                                    <option>NTA Level 4</option>
+                                                                    <option>NTA Level 5</option>
+                                                                    <option>NTA Level 6</option>
+                                                                </select>
+                                                            </div>
+                                                            <div>
+                                                                <label className="text-[10px] font-bold text-slate-500 uppercase">Program / Course</label>
+                                                                <select id="p2-dept" defaultValue={myReg.studentDetails?.course || 'CLINICAL MEDICINE'} className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700">
+                                                                    <option value="NURSING AND MIDWIFREY">NURSING AND MIDWIFREY</option>
+                                                                    <option value="PHYSIOTHERAPY">PHYSIOTHERAPY</option>
+                                                                    <option value="CLINICAL DENTISTRY">CLINICAL DENTISTRY</option>
+                                                                    <option value="DIAGNOSTIC RADIOGRAPHY">DIAGNOSTIC RADIOGRAPHY</option>
+                                                                    <option value="PHARMACEUTICAL SCIENCE">PHARMACEUTICAL SCIENCE</option>
+                                                                    <option value="MEDICAL LABORATORY">MEDICAL LABORATORY</option>
+                                                                    <option value="CLINICAL MEDICINE">CLINICAL MEDICINE</option>
+                                                                </select>
+                                                            </div>
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-[10px] font-bold text-slate-500 uppercase">College Fee Control Number</label>
+                                                            <input id="p2-cn" type="text" defaultValue={myReg.phase1?.bursar?.controlNumber || ''} className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 transition-all" />
+                                                        </div>
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                            <div>
+                                                                <label className="text-[10px] font-bold text-slate-500 uppercase">Total Amount Paid (TZS)</label>
+                                                                <input id="p2-amount" type="number" className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 transition-all" placeholder="e.g. 500000" />
+                                                            </div>
+                                                            <div>
+                                                                <label className="text-[10px] font-bold text-slate-500 uppercase">Date of Payment</label>
+                                                                <input 
+                                                                    type="date" 
+                                                                    value={p2Date} 
+                                                                    onChange={(e) => setP2Date(e.target.value)}
+                                                                    className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 transition-all"
+                                                                    required
+                                                                />
+                                                            </div>
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-[10px] font-bold text-slate-500 uppercase">Hostel Reason (Optional)</label>
+                                                            <textarea id="p2-reason" className="w-full p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm h-16 font-medium text-slate-600 focus:ring-2 focus:ring-blue-500 transition-all" placeholder="Briefly state your need for accommodation..."></textarea>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                <div className="flex gap-3">
+                                                    <button onClick={() => setShowP2Form(false)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-4 rounded-xl uppercase text-[10px] tracking-widest hover:bg-slate-200 transition-colors">Cancel</button>
+                                                    <button 
+                                                        onClick={async () => {
+                                                            const fullName = (document.getElementById('p2-name') as HTMLInputElement).value;
+                                                            const regNum = (document.getElementById('p2-regNum') as HTMLInputElement).value;
+                                                            const level = (document.getElementById('p2-level') as HTMLSelectElement).value;
+                                                            const dept = (document.getElementById('p2-dept') as HTMLSelectElement).value;
+                                                            const cn = (document.getElementById('p2-cn') as HTMLInputElement).value;
+                                                            const amount = (document.getElementById('p2-amount') as HTMLInputElement).value;
+                                                            const date = p2Date;
+                                                            const reason = (document.getElementById('p2-reason') as HTMLTextAreaElement).value;
+                                                            
+                                                            if (!fullName || !regNum || !cn || !amount || !date) {
+                                                                toast.error("Required: Name, Reg No, Control No, Amount, and Date must be provided.");
+                                                                return;
+                                                            }
+                                                            
+                                                            setIsSubmitting(true);
+                                                            try {
+                                                                await submitRegistrationPhase2({ 
+                                                                    fullName, 
+                                                                    regNum, 
+                                                                    level, 
+                                                                    dept, 
+                                                                    controlNumber: cn, 
+                                                                    amountPaid: amount, 
+                                                                    dateOfPayment: date, 
+                                                                    reason 
+                                                                });
+                                                                toast.success("Details submitted successfully!");
+                                                                setShowP2Form(false);
+                                                            } catch (e) {
+                                                                console.error("Submission error:", e);
+                                                                toast.error("Submission failed, please try again.");
+                                                            } finally {
+                                                                setIsSubmitting(false);
+                                                            }
+                                                        }}
+                                                        disabled={isSubmitting}
+                                                        className={`flex-[2] font-black text-white py-4 rounded-xl transition-all shadow-sm shadow-blue-100 uppercase tracking-widest text-[10px] ${isSubmitting ? 'bg-slate-400 pointer-events-none' : 'bg-cyan-600 hover:bg-blue-700'}`}
+                                                    >
+                                                        {isSubmitting ? 'Processing Clearance Request...' : 'Submit Details'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-6">
+                                                {(myReg?.phase2?.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' || myReg?.phase2?.hod?.status === 'APPROVED') && myReg?.phase2?.vicePrincipal?.status !== 'APPROVED' ? (
+                                                    <div className="bg-cyan-600 p-8 rounded-2xl shadow-sm border border-blue-500 relative overflow-hidden flex flex-col items-center justify-center text-center">
+                                                        <Clock className="w-12 h-12 text-blue-200 mb-4 animate-pulse" />
+                                                        <h4 className="text-white font-black uppercase tracking-[0.2em] text-sm mb-2">Recommended by HOD; Pending Vice Principal Confirmation</h4>
+                                                        <p className="text-blue-100 text-xs font-medium max-w-md">Your academic clearance is complete. Your profile is now safely locked and waiting for the Vice Principal to issue your final registration certificate.</p>
+                                                    </div>
+                                                ) : (
+                                                    <div className="bg-emerald-600 p-6 rounded-2xl shadow-sm border border-emerald-500 relative overflow-hidden">
+                                                        <div className="absolute top-0 right-0 p-4 opacity-10">
+                                                            <ShieldCheck className="w-20 h-20 text-white" />
+                                                        </div>
+                                                        <h4 className="text-white font-black uppercase tracking-[0.2em] text-xs mb-1">Status: Phase 2 Clearances in Progress</h4>
+                                                        <p className="text-emerald-50 text-sm font-medium">Your institutional supplement has been received. Officers are now reviewing your profile for final certification.</p>
+                                                    </div>
+                                                )}
+
+                                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                                    <div className={`p-5 rounded-2xl border-2 transition-all ${isHodApproved ? 'border-green-500 bg-green-50' : 'border-slate-100 bg-white'}`}>
+                                                        <div className="flex items-center justify-between mb-4">
+                                                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Academic Office</span>
+                                                            {isHodApproved ? <CheckCircle2 className="w-5 h-5 text-green-500" /> : <Clock className="w-5 h-5 text-amber-400 animate-pulse" />}
+                                                        </div>
+                                                        <p className="text-xs font-bold text-slate-700">HOD Clearance</p>
+                                                        <p className={`text-[10px] mt-1 font-bold ${isHodApproved ? 'text-green-600' : 'text-amber-600'}`}>
+                                                            {isHodApproved ? 'Recommended' : 'Awaiting Review'}
+                                                        </p>
+                                                    </div>
+
+                                                    <div className={`p-5 rounded-2xl border-2 transition-all ${myReg?.phase2?.warden?.status === 'APPROVED' ? 'border-green-500 bg-green-50' : 'border-slate-100 bg-white'}`}>
+                                                        <div className="flex items-center justify-between mb-4">
+                                                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Residence Office</span>
+                                                            {myReg?.phase2?.warden?.status === 'APPROVED' ? <CheckCircle2 className="w-5 h-5 text-green-500" /> : <Clock className="w-5 h-5 text-amber-400 animate-pulse" />}
+                                                        </div>
+                                                        <p className="text-xs font-bold text-slate-700">Warden Room Allocation</p>
+                                                        <p className={`text-[10px] mt-1 font-bold ${myReg?.phase2?.warden?.status === 'APPROVED' ? 'text-green-600' : 'text-amber-600'}`}>
+                                                            {myReg?.phase2?.warden?.status === 'APPROVED' ? `Allocated: ${getFormattedHostelText(myReg?.phase2?.warden)}` : 'Awaiting Allocation'}
+                                                        </p>
+                                                    </div>
+
+
+                                                    <div className={`p-5 rounded-2xl border-2 transition-all ${myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? 'border-green-500 bg-green-50' : 'border-slate-100 bg-white'}`}>
+                                                        <div className="flex items-center justify-between mb-4">
+                                                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Principal's Office</span>
+                                                            {myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? <CheckCircle2 className="w-5 h-5 text-green-500" /> : <Clock className="w-5 h-5 text-slate-300" />}
+                                                        </div>
+                                                        <p className="text-xs font-bold text-slate-700">Vice Principal Approval</p>
+                                                        <p className={`text-[10px] mt-1 font-bold ${myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? 'text-green-600' : 'text-slate-400'}`}>
+                                                            {myReg?.phase2?.vicePrincipal?.status === 'APPROVED' ? 'Fully Registered' : 'Final Step'}
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+const HostelAllocatorWidget = ({ studentId, handleAction }: { studentId: string, handleAction: (id: string, type: 'ALLOCATE', payload: any) => void }) => {
+    const [hostelType, setHostelType] = useState('Older Hostel');
+    const [blockOrFloor, setBlockOrFloor] = useState('A');
+    const [roomNumber, setRoomNumber] = useState('');
+
+    const blockOptions = hostelType === 'Older Hostel' 
+        ? ['C', 'D'] 
+        : hostelType === 'New Hostel (Female)'
+            ? ['F0', 'F1', 'F2', 'F3', 'F4']
+            : ['M0', 'M1', 'M2', 'M3', 'M4'];
+
+    useEffect(() => {
+        setBlockOrFloor(blockOptions[0]);
+    }, [hostelType]);
+
+    // Include A and B for Older Hostel if they were originally there. The user said: "add two letters C and D since the blocks are 4 in each room"
+    const olderOptions = ['A', 'B', 'C', 'D'];
+    const activeOptions = hostelType === 'Older Hostel' ? olderOptions : blockOptions;
+
+    useEffect(() => {
+        setBlockOrFloor(activeOptions[0]);
+    }, [hostelType]);
+
+    return (
+         <div className="space-y-4 bg-slate-50 p-6 rounded-2xl border border-slate-200 max-w-xl">
+             <h4 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Hostel Allocation Form</h4>
+             <div className="grid grid-cols-1 gap-4">
+                 <div className="grid grid-cols-2 gap-4">
+                     <div>
+                         <label className="text-[10px] font-bold text-slate-500 uppercase">Hostel Type</label>
+                         <select value={hostelType} onChange={e => setHostelType(e.target.value)} className="w-full p-2 bg-white border border-slate-200 rounded-lg outline-none text-xs font-bold">
+                             <option value="Older Hostel">Older Hostel</option>
+                             <option value="New Hostel (Female)">New Hostel (Female)</option>
+                             <option value="New Hostel (Male)">New Hostel (Male)</option>
+                         </select>
+                     </div>
+                     <div>
+                         <label className="text-[10px] font-bold text-slate-500 uppercase">Block / Floor</label>
+                         <select value={blockOrFloor} onChange={e => setBlockOrFloor(e.target.value)} className="w-full p-2 bg-white border border-slate-200 rounded-lg outline-none text-xs font-bold">
+                             {activeOptions.map(o => <option key={o} value={o}>{o}</option>)}
+                         </select>
+                     </div>
+                 </div>
+                 <div>
+                     <label className="text-[10px] font-bold text-slate-500 uppercase">Room Number</label>
+                     <input value={roomNumber} onChange={e => setRoomNumber(e.target.value)} type="text" className="w-full p-2 bg-white border border-slate-200 rounded-lg outline-none text-xs font-bold" placeholder="e.g. 102" />
+                 </div>
+             </div>
+             <button onClick={() => {
+                 if (roomNumber) handleAction(studentId, 'ALLOCATE', { hostel: `${hostelType} - ${blockOrFloor}`, room: roomNumber, block: blockOrFloor });
+             }} className="w-full bg-slate-800 text-white font-bold py-3 rounded-xl hover:bg-slate-900 transition-colors uppercase text-[10px] tracking-widest mt-2">
+                Allocate Room & Approve
+             </button>
+         </div>
+    );
+};
+
+const OfficerRegistrationQueue = ({ role, user, registrations, setRegistrations, loadMore, loadingMore, hasMore }: { role: string, user: any, registrations: Record<string, any>, setRegistrations: React.Dispatch<React.SetStateAction<Record<string, any>>>, loadMore: () => void, loadingMore: boolean, hasMore: boolean }) => {
+    
+    const [activeTab, setActiveTab] = useState<'QUEUE' | 'ALLOCATED' | 'APPROVED'>('QUEUE');
+
+    // Filter logic based on strict conditions
+    const actionableStudents = useMemo(() => {
+        const list = Object.entries(registrations || {}).map(([id, data]) => ({ id, ...data }));
+        
+        return list.filter(s => {
+            const wfStatus = s.workflowState?.globalStatus;
+            
+            if (activeTab === 'ALLOCATED' || activeTab === 'APPROVED') {
+                if (role === 'Warden') return s.phase2?.warden?.status === 'APPROVED';
+                if (role === 'HOD') return s.phase2Data && (s.phase2?.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' || s.phase2?.hod?.status === 'APPROVED') && (s.phase2Data?.dept === user?.departmentId || s.studentDetails?.course === user?.departmentId);
+                if (role === 'Vice Principal') return s.phase2?.vicePrincipal?.status === 'APPROVED';
+                if (role === 'Admission Officer' || role === 'Admission') return s.phase1?.admission?.status === 'APPROVED';
+                if (role === 'Bursar') return s.phase1?.bursar?.status === 'CONFIRMED';
+                if (role === 'NHIF' || role === 'NHIF Officer') return s.phase1?.nhif?.status === 'CONFIRMED';
+                if (role === 'Supplies Officer') return s.phase1?.supplies?.status === 'APPROVED';
+                return false;
+            }
+
+            if (role === 'Admission Officer' || role === 'Admission') {
+                return wfStatus === 'SUBMITTED_WAITING_FOR_ADMISSION' && s.phase1?.admission?.status === 'PENDING';
+            }
+            if (role === 'Bursar') {
+                return wfStatus === 'ADMISSION_CLEARED_PENDING_PAYMENTS' && 
+                       (s.phase1?.bursar?.status === 'PENDING' || s.phase1?.bursar?.status === 'PENDING_OFFICER_CONFIRMATION');
+            }
+            if (role === 'NHIF' || role === 'NHIF Officer') {
+                return wfStatus === 'ADMISSION_CLEARED_PENDING_PAYMENTS' && 
+                       (s.phase1?.nhif?.status === 'PENDING' || s.phase1?.nhif?.status === 'PENDING_OFFICER_CONFIRMATION');
+            }
+            if (role === 'Supplies Officer') {
+                return wfStatus !== "SUBMITTED_WAITING_FOR_ADMISSION" && 
+                       (s.phase1?.supplies?.status === 'PENDING' || s.phase1?.supplies?.status === 'PENDING_OFFICER_CONFIRMATION');
+            }
+            if (role === 'Warden' || role === 'Vice Principal' || role === 'HOD' || role === 'Academic Officer' || role === 'Admin') {
+                if (role === 'Warden') return s.phase2Data && s.phase2?.warden?.status !== 'APPROVED';
+                if (role === 'HOD') {
+                    // Only show students in THIS HOD's department
+                    const matchesDept = s.phase2Data?.dept === user?.departmentId || s.studentDetails?.course === user?.departmentId;
+                    return s.phase2Data && s.phase2?.hod?.status !== 'Recommended by HOD; Pending Vice Principal Confirmation' && matchesDept;
+                }
+                if (role === 'Vice Principal') return s.phase2?.hod?.status === 'Recommended by HOD; Pending Vice Principal Confirmation' && s.workflowState?.globalStatus !== 'Fully Registered';
+                return true;
+            }
+            return false;
+        });
+    }, [registrations, role, activeTab, user]);
+
+    const exportToCsv = () => {
+        let headers = ["Name", "Reg No", "Course", "Level"];
+        let rows: any[] = [];
+        let filename = "export.csv";
+
+        if (role === 'Warden') {
+            headers = [...headers, "Hostel", "Room", "Allocated At"];
+            rows = actionableStudents.map(s => [
+                s.studentDetails?.name,
+                s.studentDetails?.registrationNumber,
+                s.studentDetails?.course,
+                s.studentDetails?.level,
+                s.phase2?.warden?.hostelAssigned || '-',
+                s.phase2?.warden?.roomAssigned || '-',
+                s.phase2?.warden?.allocatedAt || '-'
+            ]);
+            filename = `allocated_students_${new Date().toLocaleDateString()}.csv`;
+        } else if (role === 'HOD') {
+            headers = [...headers, "Status"];
+            rows = actionableStudents.map(s => [
+                s.studentDetails?.name,
+                s.studentDetails?.registrationNumber,
+                s.studentDetails?.course,
+                s.studentDetails?.level,
+                s.phase2?.hod?.status || 'Pending'
+            ]);
+            filename = `hod_approved_students_${new Date().toLocaleDateString()}.csv`;
+        }
+
+        const csvContent = "data:text/csv;charset=utf-8," 
+            + headers.join(",") + "\n"
+            + rows.map(e => e.join(",")).join("\n");
+
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", filename);
+        document.body.appendChild(link);
+        link.click();
+    };
+
+    const [isOptimisticAction, setIsOptimisticAction] = useState(false);
+
+    const handleAction = async (studentId: string, actionType: string, payload?: any) => {
+        // Optimistic UI Update: Instantly update local state before Firestore call
+        const originalRegistrations = { ...registrations };
+        const student = originalRegistrations[studentId];
+        if (!student) return;
+
+        setIsOptimisticAction(true);
+        const updatedStudent = JSON.parse(JSON.stringify(student)); // Deep clone for safety
+
+        // Apply visual logic instantly
+        if (role === 'Admission Officer' || role === 'Admission') {
+            updatedStudent.phase1.admission.status = 'APPROVED';
+            updatedStudent.workflowState.globalStatus = 'ADMISSION_CLEARED_PENDING_PAYMENTS';
+        } else if (role === 'Bursar') {
+            if (actionType === 'ISSUE_CN') {
+                updatedStudent.phase1.bursar.controlNumber = payload;
+                updatedStudent.phase1.bursar.status = 'CONTROL_NUMBER_ISSUED';
+            } else if (actionType === 'CONFIRM') {
+                updatedStudent.phase1.bursar.status = 'CONFIRMED';
+            }
+        } else if (role === 'NHIF' || role === 'NHIF Officer') {
+            if (actionType === 'ISSUE_CN') {
+                updatedStudent.phase1.nhif.controlNumber = payload;
+                updatedStudent.phase1.nhif.status = 'CONTROL_NUMBER_ISSUED';
+            } else if (actionType === 'CONFIRM') {
+                updatedStudent.phase1.nhif.status = 'CONFIRMED';
+            }
+        } else if (role === 'Supplies Officer') {
+            if (actionType === 'ISSUE_CN') {
+                updatedStudent.phase1.supplies.controlNumber = payload;
+                updatedStudent.phase1.supplies.status = 'CONTROL_NUMBER_ISSUED';
+            } else if (actionType === 'CONFIRM') {
+                updatedStudent.phase1.supplies.status = 'APPROVED';
+            }
+        } else if (['Warden', 'HOD', 'Vice Principal'].includes(role)) {
+             const phase = updatedStudent.phase2 ? 'phase2' : 'phase1'; // Defensive check
+             const dept = role.toLowerCase() === 'viceprincipal' ? 'vicePrincipal' : role.toLowerCase();
+             if (!updatedStudent[phase]) updatedStudent[phase] = {};
+             if (!updatedStudent[phase][dept]) updatedStudent[phase][dept] = {};
+             
+             if (role === 'HOD') {
+                 updatedStudent.phase2.hod.status = 'Recommended by HOD; Pending Vice Principal Confirmation';
+                 updatedStudent.workflowState.globalStatus = 'PHASE2_RECOMMENDED_WAITING_VP';
+             } else if (role === 'Vice Principal') {
+                 updatedStudent.phase2.vicePrincipal.status = 'APPROVED';
+                 updatedStudent.workflowState.globalStatus = 'Fully Registered';
+             } else {
+                 updatedStudent[phase][dept].status = 'APPROVED';
+             }
+        }
+
+        // Apply to local state immediately
+        setRegistrations(prev => ({ ...prev, [studentId]: updatedStudent }));
+
+        try {
+            const studentRef = doc(db, 'registrations', studentId);
+            if (role === 'Admission Officer' || role === 'Admission') {
+                const batch = writeBatch(db);
+                batch.update(studentRef, {
+                    'phase1.admission.status': 'APPROVED',
+                    'workflowState.globalStatus': 'ADMISSION_CLEARED_PENDING_PAYMENTS'
+                });
+                // Also update the user doc to reflect 'Reported' status in the management system
+                batch.update(doc(db, 'users', studentId), {
+                    reportingStatus: 'Reported',
+                    reportingDate: new Date().toISOString()
+                });
+                await batch.commit();
+            } else if (role === 'Bursar') {
+                if (actionType === 'ISSUE_CN') {
+                    await updateDoc(studentRef, {
+                        'phase1.bursar.controlNumber': payload,
+                        'phase1.bursar.status': 'CONTROL_NUMBER_ISSUED'
+                    });
+                } else if (actionType === 'CONFIRM') {
+                    await updateDoc(studentRef, { 'phase1.bursar.status': 'CONFIRMED' });
+                }
+            } else if (role === 'NHIF' || role === 'NHIF Officer') {
+                if (actionType === 'ISSUE_CN') {
+                    await updateDoc(studentRef, {
+                        'phase1.nhif.controlNumber': payload,
+                        'phase1.nhif.status': 'CONTROL_NUMBER_ISSUED'
+                    });
+                } else if (actionType === 'CONFIRM') {
+                    await updateDoc(studentRef, { 'phase1.nhif.status': 'CONFIRMED' });
+                }
+            } else if (role === 'Supplies Officer') {
+                 if (actionType === 'ISSUE_CN') {
+                    await updateDoc(studentRef, {
+                        'phase1.supplies.controlNumber': payload,
+                        'phase1.supplies.status': 'CONTROL_NUMBER_ISSUED'
+                    });
+                 } else if (actionType === 'CONFIRM') {
+                      await updateDoc(studentRef, { 'phase1.supplies.status': 'APPROVED' });
+                 }
+            } else if (role === 'Warden') {
+                 if (actionType === 'ALLOCATE') {
+                    const { hostel, room, block } = payload;
+                    const updateData: any = {
+                        'phase2.warden.status': 'APPROVED',
+                        'phase2.warden.roomAssigned': room,
+                        'phase2.warden.hostelAssigned': hostel,
+                        'phase2.warden.allocatedAt': new Date().toISOString(),
+                    };
+                    if (block) updateData['phase2.warden.blockAssigned'] = block;
+                    await updateDoc(studentRef, updateData);
+                    
+                    // Also update the user doc for general visibility
+                    const userRef = doc(db, 'users', studentId);
+                    await updateDoc(userRef, {
+                        hostelStatus: 'Allocated',
+                        hostelId: hostel,
+                        roomId: room,
+                        hostelAllocationDate: new Date().toISOString()
+                    });
+                }
+            } else if (role === 'HOD') {
+                 if (actionType === 'APPROVE') {
+                    await updateDoc(studentRef, { 
+                        'phase2.hod.status': 'Recommended by HOD; Pending Vice Principal Confirmation',
+                        'workflowState.globalStatus': 'PHASE2_RECOMMENDED_WAITING_VP'
+                    });
+                }
+            } else if (role === 'Vice Principal') {
+                 if (actionType === 'APPROVE') {
+                    const batch = writeBatch(db);
+                    batch.update(studentRef, { 
+                        'phase2.vicePrincipal.status': 'APPROVED',
+                        'workflowState.globalStatus': 'Fully Registered'
+                    });
+                    batch.update(doc(db, 'users', studentId), {
+                        registrationStatus: 'Registered'
+                    });
+                    await batch.commit();
+                }
+            }
+        } catch (e: any) {
+            console.error("Firestore Update Failed, reverting UI:", e);
+            // Revert state on error
+            setRegistrations(originalRegistrations);
+            toast.error("Security/Network Error: Action could not be synced. Reverting state. Details: " + e.message);
+        } finally {
+            setIsOptimisticAction(false);
+        }
+    };
+
+    return (
+        <div className="max-w-6xl mx-auto p-8 space-y-6">
+            <div className="flex justify-between items-end border-b border-slate-200 pb-4 mb-8">
+                <h1 className="text-3xl font-black text-slate-800 flex items-center">
+                    {role} Workspace
+                    <span className="bg-slate-200 text-slate-600 text-sm px-3 py-1 rounded-full ml-4 font-bold flex items-center">
+                        Queue <span className="ml-2 w-6 h-6 bg-slate-400 text-white rounded-full flex items-center justify-center text-xs">{actionableStudents.length}</span>
+                    </span>
+                </h1>
+            </div>
+
+            {['Warden', 'HOD', 'Vice Principal', 'Admission Officer', 'Admission', 'Bursar', 'NHIF', 'NHIF Officer', 'Supplies Officer'].includes(role) && (
+                <div className="flex flex-wrap items-center gap-2 mb-6">
+                    <button 
+                        onClick={() => setActiveTab('QUEUE')} 
+                        className={`px-3 md:px-6 py-2 rounded-xl text-[10px] md:text-xs font-black tracking-widest transition-all ${activeTab === 'QUEUE' ? 'bg-cyan-600 text-white shadow-sm' : 'bg-white text-slate-400 hover:bg-slate-100 border border-slate-200'}`}
+                    >
+                        {role === 'Warden' ? 'PENDING ALLOCATION' : 'WAITING APPROVAL'}
+                    </button>
+                    <button 
+                        onClick={() => setActiveTab('APPROVED')} 
+                        className={`px-3 md:px-6 py-2 rounded-xl text-[10px] md:text-xs font-black tracking-widest transition-all ${(activeTab === 'APPROVED' || activeTab === 'ALLOCATED') ? 'bg-green-600 text-white shadow-sm' : 'bg-white text-slate-400 hover:bg-slate-100 border border-slate-200'}`}
+                    >
+                        {role === 'Warden' ? 'ALLOCATED LIST' : 'ALREADY APPROVED'}
+                    </button>
+                    {(activeTab === 'APPROVED' || activeTab === 'ALLOCATED') && (
+                        <button 
+                            onClick={exportToCsv} 
+                            className="ml-auto bg-slate-800 text-white px-3 md:px-6 py-2 rounded-xl text-[10px] md:text-xs font-black tracking-widest hover:bg-slate-900 shadow-sm flex items-center gap-2 whitespace-nowrap"
+                        >
+                            EXPORT EXCEL
+                        </button>
+                    )}
+                </div>
+            )}
+
+            {actionableStudents.length === 0 ? (
+                <div className="bg-white border border-slate-200 p-16 text-center rounded-[2.5rem] shadow-sm">
+                    <CheckCircle2 className="w-16 h-16 text-green-400 mx-auto mb-4" />
+                    <h3 className="text-xl md:text-2xl font-black text-slate-900 tracking-tight text-slate-700">Clear Deck</h3>
+                    <p className="text-slate-500 mt-2">No students currently require your action.</p>
+                </div>
+            ) : (
+                <div className="grid gap-6">
+                    {actionableStudents.map(student => (
+                        <div key={student.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                            <StudentDataDisplay student={student} />
+                            
+                            {/* Phase 1 Verification Summary & Status Badges */}
+                            {['HOD', 'Warden', 'Vice Principal'].includes(role) && (
+                                <div className="mt-4 flex flex-col gap-3">
+                                    <div className="flex gap-2 flex-wrap">
+                                        <div className="inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest text-cyan-700 bg-cyan-600/10 border border-blue-500/20">
+                                            <CheckCircle2 className="w-3.5 h-3.5" />
+                                            Phase 1 Verified
+                                        </div>
+                                        {student.workflowState?.globalStatus === 'Fully Registered' && (
+                                            <div className="inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest text-green-500 bg-green-500/10 border border-green-500/20">
+                                                <ShieldCheck className="w-3.5 h-3.5" />
+                                                Fully Registered
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 p-4 bg-slate-50 rounded-xl border border-slate-100">
+                                        <div className="flex flex-col">
+                                            <span className="text-[9px] font-black text-slate-400 uppercase">Tuition Fee</span>
+                                            <span className={`text-[10px] font-bold ${student.phase1.bursar.status === 'CONFIRMED' ? 'text-green-600' : 'text-amber-600'}`}>{student.phase1.bursar.status === 'CONFIRMED' ? 'Verified' : 'Pending'}</span>
+                                        </div>
+                                        <div className="flex flex-col">
+                                            <span className="text-[9px] font-black text-slate-400 uppercase">NHIF</span>
+                                            <span className={`text-[10px] font-bold ${student.phase1.nhif.status === 'CONFIRMED' ? 'text-green-600' : 'text-amber-600'}`}>{student.phase1.nhif.status === 'CONFIRMED' ? 'Verified' : 'Pending'}</span>
+                                        </div>
+                                        <div className="flex flex-col">
+                                            <span className="text-[9px] font-black text-slate-400 uppercase">Supplies</span>
+                                            <span className={`text-[10px] font-bold ${student.phase1.supplies?.status === 'APPROVED' ? 'text-green-600' : 'text-amber-600'}`}>{student.phase1.supplies?.status === 'APPROVED' ? 'Verified' : 'Pending'}</span>
+                                        </div>
+                                        <div className="flex flex-col">
+                                            <span className="text-[9px] font-black text-slate-400 uppercase">Admission</span>
+                                            <span className={`text-[10px] font-bold ${student.phase1.admission.status === 'APPROVED' ? 'text-green-600' : 'text-amber-600'}`}>{student.phase1.admission.status === 'APPROVED' ? 'Cleared' : 'Pending'}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {student.phase2Data && (
+                                <div className="mt-4 p-5 bg-cyan-50 border border-cyan-100 rounded-xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                    <div className="col-span-1 sm:col-span-2 lg:col-span-4 mb-2">
+                                        <h5 className="text-[10px] font-black text-blue-700 uppercase tracking-widest flex items-center gap-2">
+                                            <ShieldCheck className="w-4 h-4" />
+                                            Phase 2 Submission Data
+                                        </h5>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <span className="text-[9px] font-black text-blue-400 uppercase">Payment Control No.</span>
+                                        <span className="text-xs font-bold text-blue-900 break-words">{student.phase2Data.controlNumber}</span>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <span className="text-[9px] font-black text-blue-400 uppercase">Amount Paid</span>
+                                        <span className="text-xs font-bold text-blue-900">{student.phase2Data.amountPaid}</span>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <span className="text-[9px] font-black text-blue-400 uppercase">Date of Payment</span>
+                                        <span className="text-xs font-bold text-blue-900">{student.phase2Data.dateOfPayment}</span>
+                                    </div>
+                                    <div className="flex flex-col">
+                                        <span className="text-[9px] font-black text-blue-400 uppercase">Department / Course</span>
+                                        <span className="text-xs font-bold text-blue-900">{student.phase2Data.dept}</span>
+                                    </div>
+                                    <div className="col-span-1 sm:col-span-2 lg:col-span-4 mt-2">
+                                        <span className="text-[9px] font-black text-blue-400 uppercase">Hostel Application Reasoning</span>
+                                        <p className="text-xs font-bold text-blue-900">{student.phase2Data.reason || 'N/A'}</p>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="mt-6 border-t border-slate-100 pt-4">
+                                {(role === 'Admission Officer' || role === 'Admission') && (
+                                    <button onClick={() => handleAction(student.id, 'APPROVE')} className="bg-cyan-600 text-white font-bold py-3 px-6 rounded-xl hover:bg-indigo-700 mt-2 transition-colors">
+                                        Approve in Nactivis
+                                    </button>
+                                )}
+
+                                {role === 'Bursar' && (
+                                    <div className="space-y-4">
+                                        {student.phase1.bursar.status === 'PENDING' ? (
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-500 block mb-2 uppercase tracking-wide">Generate Fee Control Number</label>
+                                                <div className="flex gap-2 max-w-sm">
+                                                    <input id={`bc-${student.id}`} type="text" placeholder="e.g. 991234..." className="flex-1 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none" />
+                                                    <button onClick={() => {
+                                                        const val = (document.getElementById(`bc-${student.id}`) as HTMLInputElement).value;
+                                                        if (val) handleAction(student.id, 'ISSUE_CN', val);
+                                                    }} className="bg-slate-800 hover:bg-slate-900 text-white px-6 rounded-xl font-bold transition-colors">Issue</button>
+                                                </div>
+                                            </div>
+                                        ) : student.phase1.bursar.status === 'PENDING_OFFICER_CONFIRMATION' && (
+                                            <div className="bg-emerald-50 p-6 border border-emerald-200 rounded-xl max-w-md animate-in fade-in">
+                                                <p className="text-emerald-800 text-sm font-bold mb-4 flex items-center gap-2"><Award className="w-5 h-5"/> Student marked as PAID</p>
+                                                <button onClick={() => handleAction(student.id, 'CONFIRM')} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 shadow-sm transition-all">Confirm Payment</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {(role === 'NHIF' || role === 'NHIF Officer') && (
+                                    <div className="space-y-4">
+                                        {student.phase1.nhif.status === 'PENDING' ? (
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-500 block mb-2 uppercase tracking-wide">Generate NHIF Control</label>
+                                                <div className="flex gap-2 max-w-sm">
+                                                    <input id={`nhif-${student.id}`} type="text" placeholder="e.g. 88123..." className="flex-1 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none" />
+                                                    <button onClick={() => {
+                                                        const val = (document.getElementById(`nhif-${student.id}`) as HTMLInputElement).value;
+                                                        if (val) handleAction(student.id, 'ISSUE_CN', val);
+                                                    }} className="bg-slate-800 hover:bg-slate-900 text-white px-6 rounded-xl font-bold transition-colors">Issue</button>
+                                                </div>
+                                            </div>
+                                        ) : student.phase1.nhif.status === 'PENDING_OFFICER_CONFIRMATION' && (
+                                            <div className="bg-emerald-50 p-6 border border-emerald-200 rounded-xl max-w-md animate-in fade-in">
+                                                <p className="text-emerald-800 text-sm font-bold mb-4 flex items-center gap-2"><Award className="w-5 h-5"/> Student marked as PAID</p>
+                                                <button onClick={() => handleAction(student.id, 'CONFIRM')} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 shadow-sm transition-all">Confirm Payment</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {role === 'Supplies Officer' && (
+                                     <div className="space-y-4">
+                                        {student.phase1.supplies?.status === 'PENDING' ? (
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-500 block mb-2 uppercase tracking-wide">Generate Supplies Control Number</label>
+                                                <div className="flex gap-2 max-w-sm">
+                                                    <input id={`supp-${student.id}`} type="text" placeholder="e.g. 77123..." className="flex-1 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none" />
+                                                    <button onClick={() => {
+                                                        const val = (document.getElementById(`supp-${student.id}`) as HTMLInputElement).value;
+                                                        if (val) handleAction(student.id, 'ISSUE_CN', val);
+                                                    }} className="bg-slate-800 hover:bg-slate-900 text-white px-6 rounded-xl font-bold transition-colors">Issue</button>
+                                                </div>
+                                            </div>
+                                        ) : student.phase1.supplies?.status === 'PENDING_OFFICER_CONFIRMATION' && (
+                                            <div className="bg-emerald-50 p-6 border border-emerald-200 rounded-xl max-w-md animate-in fade-in">
+                                                <p className="text-emerald-800 text-sm font-bold mb-4 flex items-center gap-2"><Award className="w-5 h-5"/> Student marked as PAID & COLLECTED</p>
+                                                <button onClick={() => handleAction(student.id, 'CONFIRM')} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 shadow-sm transition-all">Approve Clearance</button>
+                                            </div>
+                                        )}
+                                     </div>
+                                )}
+
+                                 {role === 'Warden' && activeTab === 'QUEUE' && (
+                                     <HostelAllocatorWidget studentId={student.id} handleAction={handleAction} />
+                                 )}
+
+                                {role === 'Warden' && activeTab === 'ALLOCATED' && (
+                                    <div className="bg-green-50 p-4 border border-green-200 rounded-xl text-green-700 text-xs font-bold flex items-center justify-between">
+                                        <span>Room Allocated: {getFormattedHostelText(student.phase2?.warden)}</span>
+                                        <Award className="w-5 h-5" />
+                                    </div>
+                                )}
+
+                                {(['HOD', 'Vice Principal'].includes(role) && !(role === 'HOD' && activeTab === 'APPROVED')) && (
+                                     <button onClick={() => handleAction(student.id, 'APPROVE')} className="bg-slate-800 text-white font-bold py-3 px-6 rounded-xl hover:bg-slate-900 transition-colors shadow-sm">
+                                        {role === 'HOD' ? 'Recommend to Vice Principal' : role === 'Vice Principal' ? 'Confirm and Finalize Registration' : `Approve ${role} Clearance`}
+                                     </button>
+                                )}
+                                {role === 'HOD' && activeTab === 'APPROVED' && (
+                                    <div className="bg-green-50 p-4 border border-green-200 rounded-xl text-green-700 text-xs font-bold flex items-center justify-between">
+                                        <span>Recommended to Vice Principal</span>
+                                        <Award className="w-5 h-5" />
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    ))}
+                    
+                    {/* Pagination Control */}
+                    {(registrations && Object.keys(registrations).length > 0) && (
+                        <div className="flex justify-center pt-8">
+                            <button 
+                                onClick={loadMore} 
+                                disabled={!hasMore || loadingMore}
+                                className={`px-8 py-3 rounded-2xl font-bold transition-all shadow-sm ${hasMore ? 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 active:scale-95 duration-200' : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}
+                            >
+                                {loadingMore ? 'Loading...' : hasMore ? 'Load More Students' : 'No More Records'}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const TrackerItem = ({ label, done }: { label: string, done: boolean }) => (
+    <div className="flex items-center gap-3">
+        {done ? <CheckCircle2 className="w-5 h-5 text-green-500" /> : <div className="w-5 h-5 rounded-full border-2 border-slate-300" />}
+        <span className={done ? "text-slate-800 font-bold" : "text-slate-500 font-medium"}>{label}</span>
+    </div>
+);
+
+const StudentDataDisplay = ({ student }: { student: any }) => {
+    const data = student?.studentDetails;
+    const isPhase1Verified = student?.phase1?.admission?.status === 'APPROVED' && student?.phase1?.bursar?.status === 'CONFIRMED' && student?.phase1?.nhif?.status === 'CONFIRMED' && student?.phase1?.supplies?.status === 'APPROVED';
+    const isFullyRegistered = student?.phase2?.vicePrincipal?.status === 'APPROVED';
+
+    return (
+        <div className="flex flex-col gap-4 text-sm bg-slate-50 p-5 rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+            {(isFullyRegistered || isPhase1Verified || data?.heslbStatus) && (
+                <div className="flex flex-wrap items-center gap-2 mb-2 pb-4 border-b border-slate-200/60">
+                    {isFullyRegistered ? (
+                         <div className="inline-flex items-center gap-1.5 bg-green-500/10 text-green-700 px-3 py-1 rounded-full border border-green-500/20 shadow-sm">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span className="text-[10px] font-black uppercase tracking-widest">Fully Registered</span>
+                         </div>
+                    ) : isPhase1Verified ? (
+                         <div className="inline-flex items-center gap-1.5 bg-cyan-600/10 text-cyan-800 px-3 py-1 rounded-full border border-blue-500/20 shadow-sm">
+                            <ShieldCheck className="w-3.5 h-3.5" />
+                            <span className="text-[10px] font-black uppercase tracking-widest">Phase 1 Verified</span>
+                         </div>
+                    ) : null}
+                    
+                    {data?.heslbStatus === 'Loan Beneficiary' && (
+                         <span className="px-3 py-1.5 text-[10px] font-bold rounded-full bg-sky-500/10 text-sky-700 uppercase tracking-widest border border-sky-500/20 shadow-sm">
+                             HESLB: {data?.loanPercentage}
+                         </span>
+                    )}
+                    {(data?.heslbStatus === 'Self-Sponsored (Private)' || data?.heslbStatus === 'Parents') && (
+                         <span className="px-3 py-1.5 text-[10px] font-bold rounded-full bg-amber-500/10 text-amber-700 uppercase tracking-widest border border-amber-500/20 shadow-sm">
+                             Self-Sponsored
+                         </span>
+                    )}
+                </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-y-6 gap-x-4">
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Name</span><span className="font-bold text-slate-800 text-sm">{data?.name}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Reg No</span><span className="font-bold text-slate-800 text-sm break-words">{data?.registrationNumber}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Course</span><span className="font-bold text-blue-700 text-sm">{data?.course}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Level</span><span className="font-bold text-slate-800 text-sm">{data?.level}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Age</span><span className="font-bold text-slate-800 text-sm">{data?.age}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Housing</span><span className="font-bold text-amber-700 text-sm">{data?.housingStatus}</span></div>
+                <div><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">Phone</span><span className="font-bold text-slate-800 text-sm">{data?.phoneNumber || 'N/A'}</span></div>
+                {(data?.age >= 18 || data?.nida) && (
+                    <div className="col-span-1"><span className="text-slate-400 block text-[10px] uppercase font-bold tracking-widest mb-1">NIDA Number</span><span className="font-bold text-slate-800 text-sm break-words">{data?.nida || 'Pending'}</span></div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default RegistrationView;
+
